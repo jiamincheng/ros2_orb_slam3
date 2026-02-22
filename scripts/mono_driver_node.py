@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-
 """
 Python node for the MonocularMode cpp node.
 
@@ -8,248 +7,273 @@ Author: Azmyin Md. Kamal
 Date: 01/01/2024
 
 Requirements
-* Dataset must be configured in EuRoC MAV format
-* Paths to dataset must be set before bulding (or running) this node
-* Make sure to set path to your workspace in common.hpp
+Dataset must be configured in EuRoC MAV format
+Paths to dataset must be set before building or running this node
+Make sure to set path to your workspace in common.hpp
 
 Command line arguments
--- settings_name: EuRoC, TUM2, KITTI etc; the name of the .yaml file containing camera intrinsics and other configurations
--- image_seq: MH01, V102, etc; the name of the image sequence you want to run
-
+settings_name: EuRoC, TUM2, KITTI etc; the name of the yaml file containing camera intrinsics and other configurations
+image_seq: MH01, V102, etc; the name of the image sequence you want to run
+publish_simple_mask: if True, also publish a simple half mask to mask_topic
+mask_topic: topic name for mask publishing
+mask_top_value: pixel value for the top half of the mask
+mask_bottom_value: pixel value for the bottom half of the mask
+frame_id: frame_id to stamp into Image headers
 """
 
-# Imports
-#* Import Python modules
-import sys # System specific modules
-import os # Operating specific functions
-import glob
-import time # Python timing module
-import copy # For deepcopying arrays
-import shutil # High level folder operation tool
-from pathlib import Path # To find the "home" directory location
-import argparse # To accept user arguments from commandline
-import natsort # To ensure all images are chosen loaded in the correct order
-import yaml # To manipulate YAML files for reading configuration files
-import copy # For making deepcopies of openCV matrices, python lists, numpy arrays etc.
-import numpy as np # Python Linear Algebra module
-import cv2 # OpenCV
+import os
+import time
+from pathlib import Path
 
-#* ROS2 imports
-import ament_index_python.packages
+import natsort
+import numpy as np
+import cv2
+
 import rclpy
 from rclpy.node import Node
-from rclpy.parameter import Parameter
 
-# If you have more files in the submodules folder
-# from .submodules.py_utils import fn1 # Import helper functions from files in your submodules folder
+from sensor_msgs.msg import Image
+from std_msgs.msg import String, Float64
+from builtin_interfaces.msg import Time as RosTime
+from cv_bridge import CvBridge, CvBridgeError
 
-# Import a custom message interface
-# from your_custom_msg_interface.msg import CustomMsg #* Note the camel caps convention
 
-# Import ROS2 message templates
-from sensor_msgs.msg import Image # http://wiki.ros.org/sensor_msgs
-from std_msgs.msg import String, Float64 # ROS2 string message template
-from cv_bridge import CvBridge, CvBridgeError # Library to convert image messages to numpy array
-
-#* Class definition
 class MonoDriver(Node):
-    def __init__(self, node_name = "mono_py_node"):
-        super().__init__(node_name) # Initializes the rclpy.Node class. It expects the name of the node
+    def __init__(self, node_name: str = "mono_py_node"):
+        super().__init__(node_name)
 
-        # Initialize parameters to be passed from the command line (or launch file)
-        self.declare_parameter("settings_name","EuRoC")
-        self.declare_parameter("image_seq","NULL")
+        # Parameters
+        self.declare_parameter("settings_name", "EuRoC")
+        self.declare_parameter("image_seq", "NULL")
 
-        #* Parse values sent by command line
-        self.settings_name = str(self.get_parameter('settings_name').value) 
-        self.image_seq = str(self.get_parameter('image_seq').value)
+        # New parameters for optional mask publishing
+        self.declare_parameter("publish_simple_mask", False)
+        self.declare_parameter("mask_topic", "/caustics/mask")
+        self.declare_parameter("mask_top_value", 0)
+        self.declare_parameter("mask_bottom_value", 255)
+        self.declare_parameter("frame_id", "cam0")
 
-        # DEBUG
-        print(f"-------------- Received parameters --------------------------\n")
+        # Parse parameters
+        self.settings_name = str(self.get_parameter("settings_name").value)
+        self.image_seq = str(self.get_parameter("image_seq").value)
+
+        self.publish_simple_mask = bool(self.get_parameter("publish_simple_mask").value)
+        self.mask_topic = str(self.get_parameter("mask_topic").value)
+        self.mask_top_value = int(self.get_parameter("mask_top_value").value)
+        self.mask_bottom_value = int(self.get_parameter("mask_bottom_value").value)
+        self.frame_id = str(self.get_parameter("frame_id").value)
+
+        # Debug prints
+        print("-------------- Received parameters --------------------------")
         print(f"self.settings_name: {self.settings_name}")
         print(f"self.image_seq: {self.image_seq}")
+        print(f"self.publish_simple_mask: {self.publish_simple_mask}")
+        print(f"self.mask_topic: {self.mask_topic}")
+        print(f"self.mask_top_value: {self.mask_top_value}")
+        print(f"self.mask_bottom_value: {self.mask_bottom_value}")
+        print(f"self.frame_id: {self.frame_id}")
         print()
 
-        # Global path definitions
-        self.home_dir = str(Path.home()) + "/ros2_ws/src/ros2_orb_slam3" #! Change this to match path to your workspace
-        self.parent_dir = "TEST_DATASET" #! Change or provide path to the parent directory where data for all image sequences are stored
-        self.image_sequence_dir = self.home_dir + "/" + self.parent_dir + "/" + self.image_seq # Full path to the image sequence folder
+        # Paths
+        self.home_dir = str(Path.home()) + "/ros2_ws/src/ros2_orb_slam3"
+        self.parent_dir = "TEST_DATASET"
+        self.image_sequence_dir = self.home_dir + "/" + self.parent_dir + "/" + self.image_seq
+        print(f"self.image_sequence_dir: {self.image_sequence_dir}")
+        print()
 
-        print(f"self.image_sequence_dir: {self.image_sequence_dir}\n")
-
-        # Global variables
-        self.node_name = "mono_py_driver"
-        self.image_seq_dir = ""
+        # Data lists
+        self.imgz_seqz_dir = ""
         self.imgz_seqz = []
-        self.time_seqz = [] # Maybe redundant
+        self.time_seqz = []
 
-        # Define a CvBridge object
+        # CvBridge
         self.br = CvBridge()
 
-        # Read images from the chosen dataset, order them in ascending order and prepare timestep data as well
-        self.imgz_seqz_dir, self.imgz_seqz, self.time_seqz = self.get_image_dataset_asl(self.image_sequence_dir, "mav0") 
+        # Load dataset
+        self.imgz_seqz_dir, self.imgz_seqz, self.time_seqz = self.get_image_dataset_asl(
+            self.image_sequence_dir, "mav0"
+        )
 
-        print(self.image_seq_dir)
-        print(len(self.imgz_seqz))
+        print(f"img_dir: {self.imgz_seqz_dir}")
+        print(f"num_images: {len(self.imgz_seqz)}")
+        print()
 
-        #* ROS2 publisher/subscriber variables [HARDCODED]
-        self.pub_exp_config_name = "/mono_py_driver/experiment_settings" 
+        # ROS topics
+        self.pub_exp_config_name = "/mono_py_driver/experiment_settings"
         self.sub_exp_ack_name = "/mono_py_driver/exp_settings_ack"
         self.pub_img_to_agent_name = "/mono_py_driver/img_msg"
         self.pub_timestep_to_agent_name = "/mono_py_driver/timestep_msg"
-        self.send_config = True # Set False once handshake is completed with the cpp node
-        
-        #* Setup ROS2 publishers and subscribers
-        self.publish_exp_config_ = self.create_publisher(String, self.pub_exp_config_name, 1) # Publish configs to the ORB-SLAM3 C++ node
 
-        #* Build the configuration string to be sent out
-        #self.exp_config_msg = self.settings_name + "/" + self.image_seq # Example EuRoC/sample_euroc_MH05
-        self.exp_config_msg = self.settings_name # Example EuRoC
-        print(f"Configuration to be sent: {self.exp_config_msg}")
+        self.send_config = True
 
-
-        #* Subscriber to get acknowledgement from CPP node that it received experimetn settings
-        self.subscribe_exp_ack_ = self.create_subscription(String, 
-                                                           self.sub_exp_ack_name, 
-                                                           self.ack_callback ,10)
-        self.subscribe_exp_ack_
-
-        # Publisher to send RGB image
+        # Publishers
+        self.publish_exp_config_ = self.create_publisher(String, self.pub_exp_config_name, 1)
         self.publish_img_msg_ = self.create_publisher(Image, self.pub_img_to_agent_name, 1)
-        
         self.publish_timestep_msg_ = self.create_publisher(Float64, self.pub_timestep_to_agent_name, 1)
 
+        # Optional mask publisher
+        self.publish_mask_msg_ = None
+        if self.publish_simple_mask:
+            self.publish_mask_msg_ = self.create_publisher(Image, self.mask_topic, 1)
 
-        # Initialize work variables for main logic
-        self.start_frame = 0 # Default 0
-        self.end_frame = -1 # Default -1
-        self.frame_stop = -1 # Set -1 to use the whole sequence, some positive integer to force sequence to stop, 350 test2, 736 test3
-        self.show_imgz = False # Default, False, set True to see the output directly from this node
-        self.frame_id = 0 # Integer id of an image frame
-        self.frame_count = 0 # Ensure we are consistent with the count number of the frame
-        self.inference_time = [] # List to compute average time
+        # Handshake message
+        self.exp_config_msg = self.settings_name
+        print(f"Configuration to be sent: {self.exp_config_msg}")
+
+        # Subscriber for ack
+        self.subscribe_exp_ack_ = self.create_subscription(
+            String, self.sub_exp_ack_name, self.ack_callback, 10
+        )
+
+        # Work variables
+        self.start_frame = 0
+        self.end_frame = -1
+        self.frame_stop = -1
+        self.frame_id_int = 0
 
         print()
-        print(f"MonoDriver initialized, attempting handshake with CPP node")
-    # ****************************************************************************************
+        print("MonoDriver initialized, attempting handshake with CPP node")
 
-    # ****************************************************************************************
-    def get_image_dataset_asl(self, exp_dir, agent_name = "mav0"):
+    def get_image_dataset_asl(self, exp_dir: str, agent_name: str = "mav0"):
         """
-            Returns images and list of timesteps in ascending order from a ASL formatted dataset
+        Returns image file names and timesteps in ascending order from an ASL formatted dataset.
         """
-        
-        # Define work variables
-        imgz_file_list = []
+        agent_cam0_fld = exp_dir + "/" + agent_name + "/cam0"
+        imgz_file_dir = agent_cam0_fld + "/data/"
+        imgz_file_list = natsort.natsorted(os.listdir(imgz_file_dir), reverse=False)
+
         time_list = []
-
-        #* Only works for EuRoC MAV format
-        agent_cam0_fld = exp_dir + "/" + agent_name + "/" + "cam0"
-        imgz_file_dir = agent_cam0_fld + "/" + "data" + "/"
-        imgz_file_list = natsort.natsorted(os.listdir(imgz_file_dir),reverse=False)
-        # print(len(img_file_list)) # Debug, checks the number of rgb images
-
-        # Extract timesteps from image names
-        for iox in imgz_file_list:
-            time_step = iox.split(".")[0]
+        for name in imgz_file_list:
+            time_step = name.split(".")[0]
             time_list.append(time_step)
-            #print(time_step)
 
         return imgz_file_dir, imgz_file_list, time_list
-    # ****************************************************************************************
 
-    # ****************************************************************************************
-    def ack_callback(self, msg):
-        """
-            Callback function
-        """
+    def ack_callback(self, msg: String):
         print(f"Got ack: {msg.data}")
-        
-        if(msg.data == "ACK"):
+        if msg.data == "ACK":
             self.send_config = False
-            # self.subscribe_exp_ack_.destory() # TODO doesn't work 
-    # ****************************************************************************************
-    
-    # ****************************************************************************************
+
     def handshake_with_cpp_node(self):
-        """
-            Send and receive acknowledge of sent configuration settings
-        """
-        if (self.send_config == True):
-            # print(f"Sent mesasge: {self.exp_config_msg}")
+        if self.send_config:
             msg = String()
             msg.data = self.exp_config_msg
             self.publish_exp_config_.publish(msg)
             time.sleep(0.01)
-    # ****************************************************************************************
-    
-    # ****************************************************************************************
-    def run_py_node(self, idx, imgz_name):
+
+    @staticmethod
+    def timestamp_ns_from_filename(imgz_name: str) -> int:
         """
-            Master function that sends the RGB image message to the CPP node
+        EuRoC style filename is usually a timestamp in nanoseconds, like 1403636579763555584.png
         """
-
-        # Initialize work variables
-        img_msg = None # sensor_msgs image object
-
-        # Path to this image
-        img_look_up_path = self.imgz_seqz_dir  + imgz_name
-        timestep = float(imgz_name.split(".")[0]) # Kept if you use a custom message interface to also pass timestep value
-        self.frame_id = self.frame_id + 1  
-        #print(img_look_up_path)
-        # print(f"Frame ID: {frame_id}")
-
-        # Based on the tutorials
-        img_msg = self.br.cv2_to_imgmsg(cv2.imread(img_look_up_path), encoding="passthrough")
-        timestep_msg = Float64()
-        timestep_msg.data = timestep
-
-        # Publish RGB image and timestep, must be in the order shown below. I know not very optimum, you can use a custom message interface to send both
+        base = imgz_name.split(".")[0]
         try:
-            self.publish_timestep_msg_.publish(timestep_msg) 
-            self.publish_img_msg_.publish(img_msg)
-        except CvBridgeError as e:
-            print(e)
-    # ****************************************************************************************
-        
+            return int(base)
+        except ValueError:
+            return 0
 
-# main function
-def main(args = None):
-    rclpy.init(args=args) # Initialize node
-    n = MonoDriver("mono_py_node") #* Initialize the node
-    rate = n.create_rate(20) # https://answers.ros.org/question/358343/rate-and-sleep-function-in-rclpy-library-for-ros2/
-    
-    #* Blocking loop to initialize handshake
-    while(n.send_config == True):
+    @staticmethod
+    def rostime_from_ns(ts_ns: int) -> RosTime:
+        t = RosTime()
+        if ts_ns <= 0:
+            t.sec = 0
+            t.nanosec = 0
+            return t
+        t.sec = int(ts_ns // 1_000_000_000)
+        t.nanosec = int(ts_ns % 1_000_000_000)
+        return t
+
+    def build_half_mask(self, height: int, width: int) -> np.ndarray:
+        """
+        Build a mono8 mask with top half mask_top_value and bottom half mask_bottom_value.
+        """
+        mask = np.zeros((height, width), dtype=np.uint8)
+        mid = height // 2
+        mask[:mid, :] = np.uint8(self.mask_top_value)
+        mask[mid:, :] = np.uint8(self.mask_bottom_value)
+        return mask
+
+    def run_py_node(self, idx: int, imgz_name: str):
+        """
+        Send RGB image and timestep to the CPP node.
+        Optionally publish a half mask with matching header.
+        """
+        img_look_up_path = self.imgz_seqz_dir + imgz_name
+
+        ts_ns = self.timestamp_ns_from_filename(imgz_name)
+        stamp_msg = self.rostime_from_ns(ts_ns)
+
+        timestep_msg = Float64()
+        timestep_msg.data = float(ts_ns) if ts_ns > 0 else float(idx)
+
+        bgr = cv2.imread(img_look_up_path, cv2.IMREAD_COLOR)
+        if bgr is None:
+            self.get_logger().warn(f"Failed to read image: {img_look_up_path}")
+            return
+
+        try:
+            img_msg = self.br.cv2_to_imgmsg(bgr, encoding="bgr8")
+        except CvBridgeError as e:
+            self.get_logger().error(f"CvBridge error: {e}")
+            return
+
+        # Stamp header
+        img_msg.header.stamp = stamp_msg
+        img_msg.header.frame_id = self.frame_id
+
+        # Publish image and timestep
+        self.publish_timestep_msg_.publish(timestep_msg)
+        self.publish_img_msg_.publish(img_msg)
+
+        # Optional mask publish
+        if self.publish_mask_msg_ is not None:
+            h, w = bgr.shape[0], bgr.shape[1]
+            mask_np = self.build_half_mask(h, w)
+            try:
+                mask_msg = self.br.cv2_to_imgmsg(mask_np, encoding="mono8")
+            except CvBridgeError as e:
+                self.get_logger().error(f"CvBridge error for mask: {e}")
+                return
+
+            mask_msg.header.stamp = stamp_msg
+            mask_msg.header.frame_id = self.frame_id
+            self.publish_mask_msg_.publish(mask_msg)
+
+        self.frame_id_int += 1
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    n = MonoDriver("mono_py_node")
+    rate = n.create_rate(20)
+
+    # Handshake loop
+    while n.send_config:
         n.handshake_with_cpp_node()
         rclpy.spin_once(n)
-        #self.rate.sleep(10) # Potential bug, breaks code
-
-        if(n.send_config == False):
+        if not n.send_config:
             break
-        
-    print(f"Handshake complete")
 
-    #* Blocking loop to send RGB image and timestep message
+    print("Handshake complete")
+
+    # Publish loop
     for idx, imgz_name in enumerate(n.imgz_seqz[n.start_frame:n.end_frame]):
         try:
-            rclpy.spin_once(n) # Blocking we need a non blocking take care of callbacks
+            rclpy.spin_once(n)
             n.run_py_node(idx, imgz_name)
             rate.sleep()
 
-            # DEBUG, if you want to halt sending images after a certain Frame is reached
-            if (n.frame_id>n.frame_stop and n.frame_stop != -1):
-                print(f"BREAK!")
+            if n.frame_id_int > n.frame_stop and n.frame_stop != -1:
+                print("BREAK!")
                 break
-        
+
         except KeyboardInterrupt:
             break
 
-    # Cleanup
-    cv2.destroyAllWindows() # Close all image windows
-    n.destroy_node() # Release all resource related to this node
+    cv2.destroyAllWindows()
+    n.destroy_node()
     rclpy.shutdown()
 
-# Dunders, this .py is the main file
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
