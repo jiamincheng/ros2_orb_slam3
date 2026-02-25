@@ -2,3 +2,12 @@ README.md
 *.mp4
 .vscode/
 build/
+
+# datasets and outputs stay local only
+TEST_DATASET/
+result/
+img/
+*.bag
+*.mcap
+*.db3
+
